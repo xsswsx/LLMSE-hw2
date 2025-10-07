@@ -5,7 +5,8 @@ from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QListWidgetItem, QFileDialog,
-    QLabel, QLineEdit, QSlider, QGroupBox, QFormLayout, QMessageBox
+    QLabel, QLineEdit, QSlider, QGroupBox, QFormLayout, QMessageBox,
+    QComboBox, QRadioButton, QButtonGroup
 )
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtCore import Qt, QSize
@@ -139,8 +140,8 @@ class MainWindow(QMainWindow):
 
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(0, 100)
-        self.opacity_slider.setValue(30)
-        self.lbl_opacity = QLabel("30%")
+        self.opacity_slider.setValue(100)
+        self.lbl_opacity = QLabel("100%")
         op_layout = QHBoxLayout()
         op_layout.addWidget(self.opacity_slider)
         op_layout.addWidget(self.lbl_opacity)
@@ -154,6 +155,36 @@ class MainWindow(QMainWindow):
         exp_layout.addWidget(self.btn_choose_export)
         form.addRow(QLabel("导出路径："), self.wrap_layout(exp_layout))
 
+        # 导出格式
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["PNG", "JPEG"])
+        form.addRow(QLabel("输出格式："), self.format_combo)
+
+        # 命名规则
+        self.rb_keep = QRadioButton("保留原文件名")
+        self.rb_prefix = QRadioButton("添加前缀")
+        self.rb_suffix = QRadioButton("添加后缀")
+        self.rb_keep.setChecked(True)
+        self.name_group = QButtonGroup(self)
+        self.name_group.addButton(self.rb_keep)
+        self.name_group.addButton(self.rb_prefix)
+        self.name_group.addButton(self.rb_suffix)
+        rule_layout = QHBoxLayout()
+        rule_layout.addWidget(self.rb_keep)
+        rule_layout.addWidget(self.rb_prefix)
+        rule_layout.addWidget(self.rb_suffix)
+        form.addRow(QLabel("命名规则："), self.wrap_layout(rule_layout))
+
+        self.input_prefix = QLineEdit()
+        self.input_prefix.setPlaceholderText("例如：wm_")
+        self.input_prefix.setEnabled(False)
+        form.addRow(QLabel("前缀："), self.input_prefix)
+
+        self.input_suffix = QLineEdit()
+        self.input_suffix.setPlaceholderText("例如：_watermarked")
+        self.input_suffix.setEnabled(False)
+        form.addRow(QLabel("后缀："), self.input_suffix)
+
         right_box.addStretch()
 
         self.btn_process = QPushButton("开始处理")
@@ -166,6 +197,9 @@ class MainWindow(QMainWindow):
         self.btn_choose_export.clicked.connect(self.choose_export_dir)
         self.btn_process.clicked.connect(self.process_images)
         self.opacity_slider.valueChanged.connect(self.on_opacity_change)
+        self.rb_keep.toggled.connect(self.on_name_rule_change)
+        self.rb_prefix.toggled.connect(self.on_name_rule_change)
+        self.rb_suffix.toggled.connect(self.on_name_rule_change)
 
     def wrap_layout(self, inner_layout: QHBoxLayout) -> QWidget:
         w = QWidget()
@@ -174,6 +208,13 @@ class MainWindow(QMainWindow):
 
     def on_opacity_change(self, val: int):
         self.lbl_opacity.setText(f"{val}%")
+
+    def on_name_rule_change(self, checked: bool):
+        # 启用/禁用前缀/后缀输入框
+        use_prefix = self.rb_prefix.isChecked()
+        use_suffix = self.rb_suffix.isChecked()
+        self.input_prefix.setEnabled(use_prefix)
+        self.input_suffix.setEnabled(use_suffix)
 
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -197,6 +238,14 @@ class MainWindow(QMainWindow):
         export_dir = self.export_path.text().strip()
         wm_text = self.input_text.text().strip()
         opacity_percent = self.opacity_slider.value()
+        fmt = (self.format_combo.currentText() or "PNG").upper()
+        name_rule = "keep"
+        if self.rb_prefix.isChecked():
+            name_rule = "prefix"
+        elif self.rb_suffix.isChecked():
+            name_rule = "suffix"
+        prefix_text = self.input_prefix.text().strip()
+        suffix_text = self.input_suffix.text().strip()
 
         if not export_dir:
             QMessageBox.warning(self, "提示", "请先选择导出目录。")
@@ -212,6 +261,14 @@ class MainWindow(QMainWindow):
         if not paths:
             QMessageBox.information(self, "提示", "请先导入图片。")
             return
+
+        # 禁止导出到原文件夹（默认不允许）
+        exp_norm = os.path.normcase(os.path.abspath(export_dir))
+        for p in paths:
+            src_dir = os.path.normcase(os.path.abspath(os.path.dirname(p)))
+            if exp_norm == src_dir:
+                QMessageBox.warning(self, "禁止导出到源目录", "为防止覆盖原图，禁止将导出路径设置为源图片所在文件夹。请更换导出目录。")
+                return
         if not wm_text:
             res = QMessageBox.question(self, "确认", "水印内容为空，是否继续？", QMessageBox.Yes | QMessageBox.No)
             if res != QMessageBox.Yes:
@@ -225,7 +282,7 @@ class MainWindow(QMainWindow):
         failed = []
         for p in paths:
             try:
-                self.apply_watermark(p, wm_text, opacity_percent, export_dir)
+                self.apply_watermark(p, wm_text, opacity_percent, export_dir, fmt, name_rule, prefix_text, suffix_text)
             except Exception as e:
                 failed.append((p, str(e)))
 
@@ -240,7 +297,7 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "完成", "全部图片处理完成！")
 
-    def apply_watermark(self, img_path: str, text: str, opacity_percent: int, export_dir: str):
+    def apply_watermark(self, img_path: str, text: str, opacity_percent: int, export_dir: str, fmt: str, name_rule: str, prefix_text: str, suffix_text: str):
         # Open image
         img = Image.open(img_path)
         img_mode = img.mode
@@ -298,18 +355,25 @@ class MainWindow(QMainWindow):
         # Convert back to original mode for saving
         save_img = combined.convert(img_mode if img_mode != "P" else "RGBA")
 
-        # Save with same filename to export_dir
-        fname = os.path.basename(img_path)
-        out_path = os.path.join(export_dir, fname)
+        # 输出文件名与格式
+        base_name, _ = os.path.splitext(os.path.basename(img_path))
+        if name_rule == "prefix" and prefix_text:
+            out_base = f"{prefix_text}{base_name}"
+        elif name_rule == "suffix" and suffix_text:
+            out_base = f"{base_name}{suffix_text}"
+        else:
+            out_base = base_name
 
-        # Ensure extension compatible; use original format if possible
-        try:
-            save_img.save(out_path)
-        except Exception:
-            # Fallback to PNG
-            base_name, _ = os.path.splitext(out_path)
-            out_path = base_name + ".png"
-            save_img.save(out_path)
+        out_ext = ".png" if fmt == "PNG" else ".jpg"
+        out_path = os.path.join(export_dir, out_base + out_ext)
+
+        # 保存为指定格式
+        if fmt == "JPEG":
+            to_save = combined.convert("RGB")  # JPEG 不支持透明
+            to_save.save(out_path, "JPEG", quality=90, subsampling=0, optimize=True)
+        else:
+            to_save = combined.convert("RGBA")
+            to_save.save(out_path, "PNG", optimize=True)
 
         # Close resources
         img.close()
