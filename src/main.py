@@ -434,7 +434,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "错误", f"无法创建导出目录：{e}")
                 return
 
-        paths = self.list_widget.get_selected_paths()
+        # 改为总是导出列表中的所有图片（与选中状态无关）
+        paths = [self.list_widget.item(i).data(Qt.UserRole) for i in range(self.list_widget.count())]
         if not paths:
             QMessageBox.information(self, "提示", "请先导入图片。")
             return
