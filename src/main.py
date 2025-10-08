@@ -1,12 +1,13 @@
 import sys
 import os
+import json
 from typing import List, Set
 from PIL import Image, ImageDraw, ImageFont
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QListWidgetItem, QFileDialog,
     QLabel, QLineEdit, QSlider, QGroupBox, QFormLayout, QMessageBox,
-    QComboBox, QRadioButton, QButtonGroup, QSpinBox
+    QComboBox, QRadioButton, QButtonGroup, QSpinBox, QInputDialog
 )
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
 from PySide6.QtCore import Qt, QSize, QPointF, Signal
@@ -398,6 +399,21 @@ class MainWindow(QMainWindow):
         self.input_suffix.setEnabled(False)
         form.addRow(QLabel("后缀："), self.input_suffix)
 
+        # 模板管理
+        self.templates_combo = QComboBox()
+        tpl_layout = QHBoxLayout()
+        tpl_layout.addWidget(self.templates_combo)
+        form.addRow(QLabel("模板："), self.wrap_layout(tpl_layout))
+
+        tpl_btns = QHBoxLayout()
+        self.btn_save_tpl = QPushButton("保存模板")
+        self.btn_load_tpl = QPushButton("加载模板")
+        self.btn_del_tpl = QPushButton("删除模板")
+        tpl_btns.addWidget(self.btn_save_tpl)
+        tpl_btns.addWidget(self.btn_load_tpl)
+        tpl_btns.addWidget(self.btn_del_tpl)
+        form.addRow(QLabel("模板操作："), self.wrap_layout(tpl_btns))
+
         # 快速定位（九宫格）
         row1 = QHBoxLayout()
         self.btn_tl = QPushButton("左上")
@@ -463,6 +479,12 @@ class MainWindow(QMainWindow):
         self.btn_bc.clicked.connect(lambda: self.set_preview_pos(0.5, 0.98))
         self.btn_br.clicked.connect(lambda: self.set_preview_pos(0.98, 0.98))
 
+        # 模板按钮连接与初始化
+        self.btn_save_tpl.clicked.connect(self.save_template)
+        self.btn_load_tpl.clicked.connect(self.load_selected_template)
+        self.btn_del_tpl.clicked.connect(self.delete_selected_template)
+        self.init_templates()
+
     def wrap_layout(self, inner_layout: QHBoxLayout) -> QWidget:
         w = QWidget()
         w.setLayout(inner_layout)
@@ -526,6 +548,152 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "选择导出目录", "")
         if folder:
             self.export_path.setText(folder)
+
+    # ========== 模板/配置管理 ==========
+    def init_templates(self):
+        self.templates_dir = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "templates")
+        self.last_settings_path = os.path.join(self.templates_dir, "last_settings.json")
+        os.makedirs(self.templates_dir, exist_ok=True)
+        self.refresh_templates()
+        # 尝试加载上次使用设置
+        self.load_last_settings()
+
+    def current_settings(self) -> dict:
+        name_rule = "keep"
+        if self.rb_prefix.isChecked():
+            name_rule = "prefix"
+        elif self.rb_suffix.isChecked():
+            name_rule = "suffix"
+        nx, ny = self.preview.get_norm_pos()
+        return {
+            "text": self.input_text.text().strip(),
+            "opacity": self.opacity_slider.value(),
+            "size_percent": self.size_spin.value(),
+            "format": self.format_combo.currentText(),
+            "name_rule": name_rule,
+            "prefix": self.input_prefix.text().strip(),
+            "suffix": self.input_suffix.text().strip(),
+            "norm_x": nx,
+            "norm_y": ny,
+            "scale": self.preview.get_scale(),
+            "export_dir": self.export_path.text().strip()
+        }
+
+    def apply_settings_to_ui(self, s: dict):
+        # 设置控件值（注意联动以更新预览）
+        self.input_text.setText(s.get("text", ""))
+        self.opacity_slider.setValue(int(s.get("opacity", 100)))
+        percent = int(s.get("size_percent", 100))
+        self.size_spin.setValue(percent)
+        self.size_slider.setValue(percent)
+
+        fmt = s.get("format", "PNG")
+        idx = self.format_combo.findText(fmt)
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
+
+        rule = s.get("name_rule", "keep")
+        if rule == "prefix":
+            self.rb_prefix.setChecked(True)
+        elif rule == "suffix":
+            self.rb_suffix.setChecked(True)
+        else:
+            self.rb_keep.setChecked(True)
+
+        self.input_prefix.setText(s.get("prefix", ""))
+        self.input_suffix.setText(s.get("suffix", ""))
+        self.export_path.setText(s.get("export_dir", ""))
+
+        # 预览位置与缩放
+        nx = float(s.get("norm_x", 0.8))
+        ny = float(s.get("norm_y", 0.85))
+        self.set_preview_pos(nx, ny)
+        self.preview.set_scale(float(s.get("scale", percent / 100.0)))
+
+    def template_path(self, name: str) -> str:
+        return os.path.join(self.templates_dir, f"{name}.json")
+
+    def refresh_templates(self):
+        # 重新列出所有模板（排除 last_settings.json）
+        self.templates_combo.clear()
+        try:
+            files = [f for f in os.listdir(self.templates_dir) if f.endswith(".json") and f != "last_settings.json"]
+            files.sort()
+            names = [os.path.splitext(f)[0] for f in files]
+            self.templates_combo.addItems(names)
+        except Exception:
+            pass
+
+    def save_template(self):
+        name, ok = QInputDialog.getText(self, "保存模板", "请输入模板名称：")
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        path = self.template_path(name)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.current_settings(), f, ensure_ascii=False, indent=2)
+            self.refresh_templates()
+            # 选中刚保存的模板
+            idx = self.templates_combo.findText(name)
+            if idx >= 0:
+                self.templates_combo.setCurrentIndex(idx)
+            QMessageBox.information(self, "成功", f"模板已保存：{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存模板失败：{e}")
+
+    def load_selected_template(self):
+        name = self.templates_combo.currentText().strip()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择一个模板。")
+            return
+        path = self.template_path(name)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.apply_settings_to_ui(data)
+            QMessageBox.information(self, "成功", f"模板已加载：{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载模板失败：{e}")
+
+    def delete_selected_template(self):
+        name = self.templates_combo.currentText().strip()
+        if not name:
+            QMessageBox.information(self, "提示", "请先选择一个模板。")
+            return
+        path = self.template_path(name)
+        res = QMessageBox.question(self, "确认删除", f"确定删除模板“{name}”吗？", QMessageBox.Yes | QMessageBox.No)
+        if res != QMessageBox.Yes:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            self.refresh_templates()
+            QMessageBox.information(self, "成功", f"模板已删除：{name}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"删除模板失败：{e}")
+
+    def save_last_settings(self):
+        try:
+            with open(self.last_settings_path, "w", encoding="utf-8") as f:
+                json.dump(self.current_settings(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def load_last_settings(self):
+        if not os.path.exists(self.last_settings_path):
+            return
+        try:
+            with open(self.last_settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.apply_settings_to_ui(data)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # 关闭前自动保存“上次使用设置”
+        self.save_last_settings()
+        super().closeEvent(event)
 
     def process_images(self):
         export_dir = self.export_path.text().strip()
