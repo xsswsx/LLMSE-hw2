@@ -6,10 +6,10 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QListWidget, QListWidgetItem, QFileDialog,
     QLabel, QLineEdit, QSlider, QGroupBox, QFormLayout, QMessageBox,
-    QComboBox, QRadioButton, QButtonGroup
+    QComboBox, QRadioButton, QButtonGroup, QSpinBox
 )
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QFont, QColor
-from PySide6.QtCore import Qt, QSize, QPointF
+from PySide6.QtCore import Qt, QSize, QPointF, Signal
 
 
 SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"}
@@ -31,15 +31,20 @@ def collect_images_from_folder(folder: str) -> List[str]:
 
 
 class PreviewWidget(QWidget):
+    # 当缩放比例改变时发出（值为 0.5~3.0）
+    scaleChanged = Signal(float)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(320)
         self._pixmap = QPixmap()
         self._wm_text = ""
         self._opacity = 1.0  # 0.0 - 1.0
+        self._scale = 1.0    # 字号比例（1.0=100%）
         # 归一化位置（文本左上角相对图像显示区域的比例坐标）
         self._norm_pos = QPointF(0.8, 0.85)
         self._dragging = False
+        self._resizing = False
 
     def set_image(self, pix: QPixmap):
         self._pixmap = pix if pix and not pix.isNull() else QPixmap()
@@ -56,6 +61,24 @@ class PreviewWidget(QWidget):
     def set_norm_pos(self, x: float, y: float):
         self._norm_pos = QPointF(max(0.0, min(1.0, x)), max(0.0, min(1.0, y)))
         self.update()
+        
+    def set_scale_percent(self, percent: int):
+        # 50% ~ 300%
+        new_scale = max(0.5, min(3.0, percent / 100.0))
+        if abs(new_scale - self._scale) > 1e-6:
+            self._scale = new_scale
+            self.scaleChanged.emit(self._scale)
+            self.update()
+
+    def set_scale(self, scale: float):
+        new_scale = max(0.5, min(3.0, scale))
+        if abs(new_scale - self._scale) > 1e-6:
+            self._scale = new_scale
+            self.scaleChanged.emit(self._scale)
+            self.update()
+
+    def get_scale(self) -> float:
+        return float(self._scale)
 
     def get_norm_pos(self):
         return float(self._norm_pos.x()), float(self._norm_pos.y())
@@ -81,7 +104,8 @@ class PreviewWidget(QWidget):
         return self.rect().adjusted(x, y, -(rw - dw - x), -(rh - dh - y))
 
     def _font_for_display(self, disp_w: int):
-        size = max(12, disp_w // 20)
+        base = max(12.0, disp_w / 20.0)
+        size = max(8.0, base * self._scale)
         f = QFont()
         f.setPointSizeF(size)
         return f
@@ -122,27 +146,86 @@ class PreviewWidget(QWidget):
         p.drawText(x + shadow_offset, y + shadow_offset + text_h, self._wm_text)
         p.setPen(fore)
         p.drawText(x, y + text_h, self._wm_text)
+
+        # 绘制右下角缩放手柄
+        handle_size = max(8, disp_w // 80)
+        p.fillRect(x + text_w - handle_size//2, y + text_h - handle_size//2, handle_size, handle_size, QColor(255, 255, 255, 180))
         p.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and not self._pixmap.isNull():
+            # 判断是否点击在缩放手柄附近
+            img_rect = self._image_draw_rect()
+            disp_w = img_rect.width()
+            disp_h = img_rect.height()
+            if disp_w > 0 and disp_h > 0:
+                # 计算文字框位置
+                font = self._font_for_display(disp_w)
+                p = QPainter(self)
+                p.setFont(font)
+                metrics = p.fontMetrics()
+                text_w = metrics.horizontalAdvance(self._wm_text)
+                text_h = metrics.height()
+                p.end()
+                x = int(img_rect.left() + self._norm_pos.x() * disp_w)
+                y = int(img_rect.top() + self._norm_pos.y() * disp_h)
+                margin = max(6, disp_w // 100)
+                x = max(img_rect.left() + margin, min(x, img_rect.right() - text_w - margin))
+                y = max(img_rect.top() + margin, min(y, img_rect.bottom() - text_h - margin))
+                handle_size = max(8, disp_w // 80)
+                hx = x + text_w - handle_size//2
+                hy = y + text_h - handle_size//2
+                handle_rect = self.rect().adjusted(hx, hy, -(self.width()-hx-handle_size), -(self.height()-hy-handle_size))
+                if handle_rect.contains(event.position().toPoint()):
+                    self._resizing = True
+                    return
             self._dragging = True
 
     def mouseMoveEvent(self, event):
-        if not self._dragging or self._pixmap.isNull():
+        if self._pixmap.isNull():
             return
         img_rect = self._image_draw_rect()
         disp_w = img_rect.width()
         disp_h = img_rect.height()
         if disp_w <= 0 or disp_h <= 0:
             return
-        rel_x = (event.position().x() - img_rect.left()) / disp_w
-        rel_y = (event.position().y() - img_rect.top()) / disp_h
-        self.set_norm_pos(rel_x, rel_y)
+        if self._resizing:
+            # 依据鼠标与文本左上角的水平距离估算目标文本宽度，进而计算 scale
+            font_base = QFont()
+            base_size = max(12.0, disp_w / 20.0)
+            font_base.setPointSizeF(base_size)
+            p = QPainter(self)
+            p.setFont(font_base)
+            base_width = max(1, p.fontMetrics().horizontalAdvance(self._wm_text))
+            p.end()
+
+            # 当前文本左上角位置（与 paint 中一致）
+            font_cur = self._font_for_display(disp_w)
+            p2 = QPainter(self)
+            p2.setFont(font_cur)
+            metrics = p2.fontMetrics()
+            text_h = metrics.height()
+            p2.end()
+
+            x = int(img_rect.left() + self._norm_pos.x() * disp_w)
+            y = int(img_rect.top() + self._norm_pos.y() * disp_h)
+            margin = max(6, disp_w // 100)
+            # x,y 会再次在 paint 时被夹紧；此处粗略计算足够
+            mouse_x = event.position().x()
+            desired_w = max(10.0, float(mouse_x - x))
+            new_scale = desired_w / float(base_width)
+            self.set_scale(max(0.5, min(3.0, new_scale)))
+            return
+
+        if self._dragging:
+            rel_x = (event.position().x() - img_rect.left()) / disp_w
+            rel_y = (event.position().y() - img_rect.top()) / disp_h
+            self.set_norm_pos(rel_x, rel_y)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._dragging = False
+            self._resizing = False
 
 class ImageListWidget(QListWidget):
     def __init__(self, parent=None):
@@ -265,6 +348,18 @@ class MainWindow(QMainWindow):
         op_layout.addWidget(self.lbl_opacity)
         form.addRow(QLabel("透明度："), self.wrap_layout(op_layout))
 
+        # 字号（百分比）
+        size_layout = QHBoxLayout()
+        self.size_slider = QSlider(Qt.Horizontal)
+        self.size_slider.setRange(50, 300)
+        self.size_slider.setValue(100)
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(50, 300)
+        self.size_spin.setValue(100)
+        size_layout.addWidget(self.size_slider)
+        size_layout.addWidget(self.size_spin)
+        form.addRow(QLabel("字号(%)："), self.wrap_layout(size_layout))
+
         self.export_path = QLineEdit()
         self.export_path.setPlaceholderText("请选择导出目录")
         self.btn_choose_export = QPushButton("选择路径")
@@ -349,6 +444,12 @@ class MainWindow(QMainWindow):
         self.list_widget.currentItemChanged.connect(self.on_list_selection_changed)
         self.list_widget.itemClicked.connect(self.on_list_selection_changed)
 
+        # 字号联动（UI -> 预览）
+        self.size_slider.valueChanged.connect(self.on_font_scale_change)
+        self.size_spin.valueChanged.connect(self.on_font_scale_change)
+        # 字号联动（预览拖拽缩放 -> UI）
+        self.preview.scaleChanged.connect(self.on_preview_scale_changed)
+
         # 快速定位（九宫格）
         self.btn_tl.clicked.connect(lambda: self.set_preview_pos(0.02, 0.02))
         self.btn_tc.clicked.connect(lambda: self.set_preview_pos(0.5, 0.02))
@@ -371,6 +472,21 @@ class MainWindow(QMainWindow):
         self.lbl_opacity.setText(f"{val}%")
         # 预览透明度实时更新
         self.preview.set_opacity_percent(val)
+
+    def on_font_scale_change(self, val: int):
+        # 同步 slider 与 spin
+        if self.sender() == self.size_slider and self.size_spin.value() != val:
+            self.size_spin.setValue(val)
+        elif self.sender() == self.size_spin and self.size_slider.value() != val:
+            self.size_slider.setValue(val)
+        self.preview.set_scale_percent(val)
+
+    def on_preview_scale_changed(self, scale: float):
+        percent = int(round(scale * 100))
+        if self.size_slider.value() != percent:
+            self.size_slider.setValue(percent)
+        if self.size_spin.value() != percent:
+            self.size_spin.setValue(percent)
 
     def on_name_rule_change(self, checked: bool):
         # 启用/禁用前缀/后缀输入框
@@ -457,13 +573,17 @@ class MainWindow(QMainWindow):
         self.btn_add_dir.setEnabled(False)
         self.btn_clear.setEnabled(False)
 
-        # 从预览获取归一化位置
+        # 从预览获取归一化位置与字号比例
         norm_x, norm_y = self.preview.get_norm_pos()
+        scale = self.preview.get_scale()
 
         failed = []
         for p in paths:
             try:
-                self.apply_watermark(p, wm_text, opacity_percent, export_dir, fmt, name_rule, prefix_text, suffix_text, norm_x, norm_y)
+                self.apply_watermark(
+                    p, wm_text, opacity_percent, export_dir, fmt,
+                    name_rule, prefix_text, suffix_text, norm_x, norm_y, scale
+                )
             except Exception as e:
                 failed.append((p, str(e)))
 
@@ -478,7 +598,7 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "完成", "全部图片处理完成！")
 
-    def apply_watermark(self, img_path: str, text: str, opacity_percent: int, export_dir: str, fmt: str, name_rule: str, prefix_text: str, suffix_text: str, norm_x: float, norm_y: float):
+    def apply_watermark(self, img_path: str, text: str, opacity_percent: int, export_dir: str, fmt: str, name_rule: str, prefix_text: str, suffix_text: str, norm_x: float, norm_y: float, scale: float):
         # Open image
         img = Image.open(img_path)
         img_mode = img.mode
@@ -500,8 +620,9 @@ class MainWindow(QMainWindow):
         for fp in candidates:
             if os.path.exists(fp):
                 try:
-                    # font size relative to image width
-                    font = ImageFont.truetype(fp, max(16, base.size[0] // 20))
+                    # font size relative to image width with scale
+                    base_px = max(16, int(base.size[0] / 20))
+                    font = ImageFont.truetype(fp, max(8, int(base_px * max(0.5, min(3.0, scale)))))
                     break
                 except Exception:
                     continue
